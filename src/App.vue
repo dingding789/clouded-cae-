@@ -2,8 +2,8 @@
   <div style="height:100vh; display:flex; flex-direction:column;">
     <header style="padding:8px; background:#20232a; color:#fff; display:flex; gap:8px; align-items:center;">
       <label style="display:inline-flex; gap:8px; align-items:center;">
-        Load FRD / INP
-        <input type="file" @change="onFile" accept=".frd,.FRD,.inp,.INP" multiple />
+        Load FRD / INP / VTU
+        <input type="file" @change="onFile" accept=".frd,.FRD,.inp,.INP,.vtu,.VTU,.vtk,.VTK" multiple />
       </label>
       <div>Scale (displacement): <input type="range" v-model.number="scale" min="0" max="200" step="1"/></div>
       <label style="display:inline-flex; gap:8px; align-items:center;">
@@ -48,7 +48,31 @@
       </div>
     </header>
 
-  <div style="display:flex; flex-direction:row; flex:1; min-height:0;">
+  <div ref="viewArea" style="position:relative; display:flex; flex-direction:row; flex:1; min-height:0;">
+    <div
+      v-if="showColorbar && frdData && frdData.fields && frdData.fields[colorFieldIndex]"
+      :style="{
+        position: 'absolute',
+        left: legendPos.x + 'px',
+        top: legendPos.y + 'px',
+        width: '150px',
+        padding: '8px 6px 8px 10px',
+        boxSizing: 'border-box',
+        background: 'linear-gradient(#f5f5f5,#dcdcdc)',
+        color: '#333',
+        fontSize: '13px',
+        lineHeight: '1.3',
+        cursor: legendDragging ? 'grabbing' : 'grab',
+        userSelect: 'none',
+        zIndex: 5
+      }"
+      @mousedown.prevent="startDrag"
+    >
+      <div style="margin-bottom:4px; font-weight:600;">{{ frdData.fields[colorFieldIndex].displayName || frdData.fields[colorFieldIndex].name }}</div>
+      <div style="margin-bottom:2px;">类型: {{ frdData.fields[colorFieldIndex].type }}</div>
+      <div style="margin-bottom:6px;">色带: {{ colorRangeMode }}</div>
+      <canvas ref="legendCanvas" style="width:110px; height:260px; border:1px solid #999; display:block;"></canvas>
+    </div>
     <three-scene
       :frdData="frdData"
       :scale="scale"
@@ -114,206 +138,335 @@
 
 <script>
 import ThreeScene from './components/ThreeScene.vue'
-import { ref, onMounted, watch } from 'vue'
-import { parseFrdText } from './utils/frdParser'
+import { ref, onMounted, watch, onBeforeUnmount } from 'vue'
+import { parseFrdWithVtk } from './utils/vtkFrdParser'
+import { parseVtuFile } from './utils/vtkVtuReader'
 
 export default {
   components: { ThreeScene },
   setup () {
     const frdData = ref(null)
-    const forcedFieldType = ref(null) // { index, type }
     const scale = ref(10)
     const nodeCount = ref(0)
-    // 旧动画/临时选择使用的索引（用于右侧“Field:”下拉与播放逻辑）
-    const stepIndex = ref(0)
-    // deformFieldIndex: 用于几何变形的字段（通常位移）
-    // colorFieldIndex: 用于着色的字段（通常应力/位移幅值/应变）
+    
+    // 核心修复：统一使用 colorFieldIndex，删掉多余的 stepIndex
     const deformFieldIndex = ref(0)
     const colorFieldIndex = ref(0)
-  const debugSolid = ref(false)
-  const applyDeformation = ref(true)
-  const showEdges = ref(true)
-  const showColorbar = ref(true)
-  const useElementColors = ref(false)
-  const flatShading = ref(false)
-  const autoScale = ref(true)
-  // 色带范围控制：auto（使用字段 min/max）、symmetric（使用 ±max）、manual（用户自填）
-  const colorRangeMode = ref('auto')
-  const colorRangeMin = ref(null)
-  const colorRangeMax = ref(null)
-  const colorbarCanvas = ref(null)
+    
+    const debugSolid = ref(false)
+    const applyDeformation = ref(true)
+    const showEdges = ref(true)
+    const showColorbar = ref(true)
+    const useElementColors = ref(false)
+    const flatShading = ref(false)
+    const autoScale = ref(true)
+    const colorRangeMode = ref('auto')
+    const colorRangeMin = ref(null)
+    const colorRangeMax = ref(null)
+    const colorbarCanvas = ref(null)
+    const legendCanvas = ref(null)
+    const viewArea = ref(null)
+    const legendPos = ref({ x: 10, y: 70 })
+    const legendDragging = ref(false)
+    const legendOffset = ref({ x: 0, y: 0 })
+    const playing = ref(false)
+    const speed = ref(1) 
 
-  // 解析文件并加载数据，以便 UI 能显示步骤/字段等信息
+    // --- 文件读取逻辑 ---
     async function onFile (e) {
       const files = Array.from((e.target.files) || [])
       if (!files.length) return
-  // 读取所有选中文件，按扩展名区分 FRD 和 INP
-      const reads = files.map(f => new Promise((res, rej) => {
+
+      // 优先识别 VTU/VTK（使用纯 XML 解析）
+      const vtuFile = files.find(f => /\.(vtk|vtu)$/i.test(f.name))
+      if (vtuFile) {
+        try {
+          const buffer = await readAsArrayBuffer(vtuFile)
+          const parsed = await parseVtuFile(buffer)
+          frdData.value = parsed
+          nodeCount.value = parsed.nodes ? parsed.nodes.length : 0
+          autoPickDefaultFields(parsed)
+          return
+        } catch (err) {
+          console.error('VTU parse error:', err)
+          alert('VTU 文件解析失败: ' + err.message)
+          return
+        }
+      }
+
+      // FRD / INP 路径（文本读取）
+      const reads = files.map(f => new Promise((res) => {
         const r = new FileReader()
         r.onload = () => res({ name: f.name, text: r.result })
-        r.onerror = rej
         r.readAsText(f)
       }))
       const results = await Promise.all(reads)
-      const frdFile = results.find(r => /\.frd$/i.test(r.name))
+      const frdFile = results.find(r => /\.frd$/i.test(r.name)) || results[0]
       const inpFile = results.find(r => /\.inp$/i.test(r.name))
+
+      if (frdFile) {
+        const parsed = parseFrdWithVtk(frdFile.text, inpFile ? inpFile.text : undefined)
+        frdData.value = parsed
+        nodeCount.value = parsed.nodes ? parsed.nodes.length : 0
+        autoPickDefaultFields(parsed)
+      }
+    }
+
+    // --- 修复后的动画逻辑 ---
+    let lastTick = performance.now()
+    function tick () {
+      if (!playing.value || !frdData.value || !frdData.value.fields) return
+      
+      const now = performance.now()
+      const dt = (now - lastTick) / 1000
+      
+      // 控制播放速度
+      if (dt >= 1 / Math.max(0.1, speed.value)) {
+        const maxIndex = frdData.value.fields.length - 1
+        
+        // 【关键修复】这里直接更新 colorFieldIndex，让画面动起来
+        let nextIndex = colorFieldIndex.value + 1
+        if (nextIndex > maxIndex) nextIndex = 0 // 循环播放
+        
+        colorFieldIndex.value = nextIndex
+        deformFieldIndex.value = nextIndex // 变形和颜色同步
+        
+        lastTick = now
+      }
+      requestAnimationFrame(tick)
+    }
+
+    function togglePlay () {
+      playing.value = !playing.value
+      if (playing.value) {
+        lastTick = performance.now()
+        requestAnimationFrame(tick)
+      }
+    }
+
+    function readAsArrayBuffer (file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result)
+        r.onerror = reject
+        r.readAsArrayBuffer(file)
+      })
+    }
+
+    // 根据解析出的字段自动选择：变形=位移；着色=标量（应力/应变/von Mises/位移幅值）
+    function autoPickDefaultFields(parsed) {
       try {
-        if (frdFile) {
-          const parsed = parseFrdText(frdFile.text, inpFile ? inpFile.text : undefined)
-          // 打印解析摘要以便调试：节点/单元/字段统计与每个字段的简要信息
-          try {
-            // 保存到全局变量，方便在 DevTools 控制台手动检查
-            window.__frdParsed = parsed
-            const fieldsSummary = (parsed.fields || []).slice(0, 12).map(f => ({ name: f.name, type: f.type, rows: f.rows, nodeHits: f.nodeHits, elHits: f.elHits, scalarCount: f.scalarCount, min: f.min, max: f.max }))
-            console.log('frd parsed summary:', { nodes: parsed.nodes ? parsed.nodes.length : 0, elements: parsed.elements ? parsed.elements.length : 0, fieldsTotal: (parsed.fields || []).length, fieldsSample: fieldsSummary })
-            // 另打印第一字段的前 10 个 scalar 值（如果存在）以便快速查看数据
-            if (parsed.fields && parsed.fields.length > 0 && parsed.fields[0].scalarValues) {
-              console.log('first field scalar sample:', parsed.fields[0].scalarValues.slice(0, 10))
-            }
-          } catch (e) { /* ignore logging errors */ }
-          frdData.value = parsed
-          nodeCount.value = parsed.nodes ? parsed.nodes.length : 0
-          stepIndex.value = 0
-        } else {
-          // 如果没有 FRD 文件，则尝试把第一个文件当作 FRD 来解析（兼容性处理）
-          const parsed = parseFrdText(results[0].text, inpFile ? inpFile.text : undefined)
-          try {
-            window.__frdParsed = parsed
-            const fieldsSummary = (parsed.fields || []).slice(0, 12).map(f => ({ name: f.name, type: f.type, rows: f.rows, nodeHits: f.nodeHits, elHits: f.elHits, scalarCount: f.scalarCount, min: f.min, max: f.max }))
-            console.log('frd parsed summary (fallback):', { nodes: parsed.nodes ? parsed.nodes.length : 0, elements: parsed.elements ? parsed.elements.length : 0, fieldsTotal: (parsed.fields || []).length, fieldsSample: fieldsSummary })
-            if (parsed.fields && parsed.fields.length > 0 && parsed.fields[0].scalarValues) {
-              console.log('first field scalar sample:', parsed.fields[0].scalarValues.slice(0, 10))
-            }
-          } catch (e) { }
-          frdData.value = parsed
-          nodeCount.value = parsed.nodes ? parsed.nodes.length : 0
-          stepIndex.value = 0
+        const fields = parsed.fields || []
+        // 选择位移字段作为变形，并自动开启 Apply deformation
+        let deformIdx = fields.findIndex(f => f && (f._forcedType === 'displacement' || f.type === 'displacement'))
+        if (deformIdx < 0) {
+          deformIdx = fields.findIndex(f => f && f.values && f.values.length)
+          if (deformIdx >= 0) {
+            fields[deformIdx]._forcedType = 'displacement'
+            fields[deformIdx].type = 'displacement'
+          }
         }
-      } catch (err) {
-        frdData.value = results[0].text
+        if (deformIdx >= 0) {
+          deformFieldIndex.value = deformIdx
+          applyDeformation.value = true
+        }
+
+        // 着色字段打分：优先标量，名称包含 mises/stress/strain/disp/mag，值域更大
+        const scoreField = (f) => {
+          let score = 0
+          const name = (f.displayName || f.name || '').toLowerCase()
+          if (f.type === 'scalar' || f.type === 'stress' || f.type === 'strain') score += 10
+          if (/mises|stress|strain|sig|eps|disp|magnitude|von/.test(name)) score += 5
+          const span = (isFinite(f.max) && isFinite(f.min)) ? Math.abs(f.max - f.min) : 0
+          score += Math.min(5, span > 0 ? Math.log10(span + 1) : 0)
+          score += Math.min(5, f.scalarCount || 0) * 0.001
+          return score
+        }
+        let colorIdx = -1
+        let bestScore = -Infinity
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i]
+          if (!f) continue
+          const s = scoreField(f)
+          if (s > bestScore) { bestScore = s; colorIdx = i }
+        }
+        if (colorIdx < 0 && deformIdx >= 0) {
+          // 若没有标量，则把位移强制为标量（幅值）用于着色
+          // 注意：直接修改 frdData 引用以触发更新
+          const f = fields[deformIdx]
+          if (f) {
+            // 简化：交给按钮逻辑已有的计算，但这里直接设置标志并让 ThreeScene 使用 scalarValues（若已有）
+            f._forcedType = 'scalar'
+            f.type = 'scalar'
+            colorIdx = deformIdx
+          }
+        }
+        if (colorIdx >= 0) colorFieldIndex.value = colorIdx
+
+        // 提升可见性：若检测到极端值导致对比度低，则默认使用 quantile 色带
+        const cf = fields[colorFieldIndex.value]
+        if (cf && cf.scalarValues) {
+          const nonNull = cf.scalarValues.filter(v => v != null && isFinite(v))
+          if (nonNull.length >= 50) {
+            const sorted = [...nonNull].sort((a,b)=>a-b)
+            const low = sorted[Math.floor(0.02*(sorted.length-1))]
+            const high = sorted[Math.floor(0.98*(sorted.length-1))]
+            const fullSpan = Math.abs((cf.max||0) - (cf.min||0))
+            const qSpan = Math.abs(high - low)
+            if (fullSpan > 0 && qSpan/fullSpan < 0.6) {
+              colorRangeMode.value = 'quantile'
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // --- 色带绘制逻辑 ---
+    function drawColorbar () {
+      const canvas = colorbarCanvas.value
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      const w = canvas.width = canvas.clientWidth || 180
+      const h = canvas.height = canvas.clientHeight || 18
+      ctx.clearRect(0, 0, w, h)
+      
+      // 绘制彩虹渐变 (Blue -> Red)
+      const grad = ctx.createLinearGradient(0, 0, w, 0)
+      grad.addColorStop(0.00, '#0000ff') // Blue
+      grad.addColorStop(0.25, '#00ffff') // Cyan
+      grad.addColorStop(0.50, '#00ff00') // Green
+      grad.addColorStop(0.75, '#ffff00') // Yellow
+      grad.addColorStop(1.00, '#ff0000') // Red
+      ctx.fillStyle = grad
+      ctx.fillRect(0, 0, w, h)
+    }
+
+    // 左侧竖向色带，带刻度文字
+    function drawLegend () {
+      const canvas = legendCanvas.value
+      if (!canvas || !frdData.value || !frdData.value.fields || !frdData.value.fields[colorFieldIndex.value]) return
+      const field = frdData.value.fields[colorFieldIndex.value]
+      const ctx = canvas.getContext('2d')
+      const w = canvas.width = canvas.clientWidth || 110
+      const h = canvas.height = canvas.clientHeight || 260
+
+      // 计算色带范围，与 ThreeScene 保持一致
+      let cMin = field.min
+      let cMax = field.max
+      if (colorRangeMode.value === 'manual') {
+        if (colorRangeMin.value != null) cMin = colorRangeMin.value
+        if (colorRangeMax.value != null) cMax = colorRangeMax.value
+      } else if (colorRangeMode.value === 'symmetric') {
+        const m = Math.max(Math.abs(cMin), Math.abs(cMax)) || 1
+        cMin = -m; cMax = m
+      }
+      if (!isFinite(cMin) || !isFinite(cMax) || Math.abs(cMax - cMin) < 1e-12) {
+        cMin = 0; cMax = 1
+      }
+
+      const fmt = (v) => {
+        const av = Math.abs(v)
+        if (av >= 1e4 || (av > 0 && av < 1e-3)) return v.toExponential(3)
+        return v.toFixed(3)
+      }
+
+      // 背景
+      ctx.fillStyle = '#f0f0f0'
+      ctx.fillRect(0, 0, w, h)
+
+      // 色带矩形
+      const barX = 12
+      const barW = 32
+      const barY = 10
+      const barH = h - 20
+
+      // 竖向渐变 (顶端红，底端蓝，中间按停靠点插值)
+      const grad = ctx.createLinearGradient(0, barY, 0, barY + barH)
+      const stops = [
+        { t: 0.00, c: '#ff0000' },
+        { t: 0.25, c: '#ff7f00' },
+        { t: 0.50, c: '#00ff00' },
+        { t: 0.75, c: '#00bfff' },
+        { t: 1.00, c: '#0000ff' }
+      ]
+      stops.forEach(s => grad.addColorStop(s.t, s.c))
+      ctx.fillStyle = grad
+      ctx.fillRect(barX, barY, barW, barH)
+      ctx.strokeStyle = '#444'
+      ctx.strokeRect(barX, barY, barW, barH)
+
+      // 刻度线和文字（9 个刻度）
+      ctx.strokeStyle = '#555'
+      ctx.fillStyle = '#222'
+      ctx.lineWidth = 1
+      const ticks = 8
+      for (let i = 0; i <= ticks; i++) {
+        const t = i / ticks
+        const y = barY + t * barH
+        ctx.beginPath()
+        ctx.moveTo(barX + barW, y)
+        ctx.lineTo(barX + barW + 8, y)
+        ctx.stroke()
+        const val = cMax - t * (cMax - cMin)
+        ctx.fillText(fmt(val), barX + barW + 12, y + 3)
       }
     }
 
-    function forceFieldAs (idx, t) {
-      if (!frdData.value || !frdData.value.fields) return
-      const f = frdData.value.fields[idx]
-      if (!f) return
-      f._forcedType = t
-      // 如果用户强制将字段视为标量，但解析器没有计算 scalarValues，则基于 values 计算幅值
-      if (t === 'scalar' && (!f.scalarValues || f.scalarValues.length === 0)) {
-        try {
-          const nodes = frdData.value.nodes || []
-          const vals = new Array(nodes.length).fill(null)
-          let min = Infinity, max = -Infinity
-          if (f.values) {
-            for (let i = 0; i < nodes.length; i++) {
-              const v = f.values[i]
-              if (!v) continue
-              const a = v.a || 0
-              const b = v.b || 0
-              const c = v.c || 0
-              const s = Math.sqrt(a * a + b * b + c * c)
-              vals[i] = s
-              if (s < min) min = s
-              if (s > max) max = s
-            }
-          }
-          if (min === Infinity) { min = 0; max = 0 }
-          f.scalarValues = vals
-          f.min = min
-          f.max = max
-          f.scalarCount = vals.reduce((c, v) => c + (v != null ? 1 : 0), 0)
-          f.type = 'scalar'
-        } catch (err) {
-          // ignore
-        }
-      }
-      // 如果强制为位移，确保 type 字段也能反映出来（便于 UI 提示）
-      if (t === 'displacement') {
-        f.type = 'displacement'
-      }
-
-      // 更新引用以触发 ThreeScene 重渲染
-      frdData.value = Object.assign({}, frdData.value)
-    }
-
-  // 动画相关控制
-        const playing = ref(false)
-        const speed = ref(1) // 每秒步数
-
-        let lastTick = performance.now()
-        function tick () {
-          if (!playing.value || !frdData.value || !frdData.value.fields) return
-          const now = performance.now()
-          const dt = (now - lastTick) / 1000
-          if (dt >= 1 / Math.max(0.01, speed.value)) {
-            const maxIndex = Math.max(0, frdData.value.fields.length - 1)
-            stepIndex.value = (stepIndex.value + 1) > maxIndex ? 0 : stepIndex.value + 1
-            lastTick = now
-          }
-          requestAnimationFrame(tick)
-        }
-
-        function togglePlay () {
-          playing.value = !playing.value
-          if (playing.value) {
-            lastTick = performance.now()
-            requestAnimationFrame(tick)
-          }
-        }
-
-    
-
-  // 绘制 colorbar 的函数
-  function drawColorbar () {
-      try {
-        const canvas = colorbarCanvas.value
-        if (!canvas) return
-        const ctx = canvas.getContext('2d')
-        const w = canvas.width = canvas.clientWidth || 180
-        const h = canvas.height = canvas.clientHeight || 18
-        // 清空画布
-        ctx.clearRect(0, 0, w, h)
-        if (!frdData.value || !frdData.value.fields || !frdData.value.fields.length) return
-        const f = frdData.value.fields[colorFieldIndex.value]
-        if (!f || !f.min || !f.max) return
-        const min = f.min
-        const max = f.max
-  // 从左到右的渐变（CAE 彩虹：蓝→青→绿→黄→橙→红）
-        const grad = ctx.createLinearGradient(0, 0, w, 0)
-        const stops = [
-          { t: 0.00, hex: '#000080' }, // 海军蓝
-          { t: 0.16, hex: '#0000ff' }, // 蓝
-          { t: 0.33, hex: '#00ffff' }, // 青
-          { t: 0.50, hex: '#00ff00' }, // 绿
-          { t: 0.66, hex: '#ffff00' }, // 黄
-          { t: 0.83, hex: '#ffa500' }, // 橙
-          { t: 1.00, hex: '#ff0000' }  // 红
-        ]
-        stops.forEach(s => grad.addColorStop(s.t, s.hex))
-        ctx.fillStyle = grad
-        ctx.fillRect(0, 0, w, h)
-  // 可选：在此绘制刻度/标签
-      } catch (err) {
-        // 忽略绘图错误
-      }
-    }
-
-    onMounted(() => {
-      drawColorbar()
+    onMounted(() => { 
+      drawColorbar(); 
+      drawLegend();
+      window.addEventListener('mousemove', onDragMove)
+      window.addEventListener('mouseup', onDragEnd)
+      window.addEventListener('mouseleave', onDragEnd)
     })
 
-    // 当着色字段或数据变化时重绘色带
-    watch([() => frdData.value, colorFieldIndex], () => {
-      setTimeout(drawColorbar, 0)
+    onBeforeUnmount(() => {
+      window.removeEventListener('mousemove', onDragMove)
+      window.removeEventListener('mouseup', onDragEnd)
+      window.removeEventListener('mouseleave', onDragEnd)
     })
 
-    // 不再使用 stepIndex 作为统一字段索引，改为 deformFieldIndex + colorFieldIndex
-    return { frdData, onFile, scale, nodeCount, deformFieldIndex, colorFieldIndex, togglePlay, playing: playing, speed, debugSolid, applyDeformation, showEdges, showColorbar, colorbarCanvas, forceFieldAs, useElementColors, flatShading, autoScale, colorRangeMode, colorRangeMin, colorRangeMax, stepIndex }
+    function startDrag (e) {
+      legendDragging.value = true
+      legendOffset.value = { x: e.clientX - legendPos.value.x, y: e.clientY - legendPos.value.y }
+    }
+
+    function onDragMove (e) {
+      if (!legendDragging.value) return
+      const area = viewArea.value?.getBoundingClientRect()
+      const minX = 0
+      const minY = 0
+      const maxX = area ? area.width - 150 : window.innerWidth
+      const maxY = area ? area.height - 280 : window.innerHeight
+      const nx = Math.min(Math.max(e.clientX - legendOffset.value.x - (area ? area.left : 0), minX), maxX)
+      const ny = Math.min(Math.max(e.clientY - legendOffset.value.y - (area ? area.top : 0), minY), maxY)
+      legendPos.value = { x: nx, y: ny }
+    }
+
+    function onDragEnd () {
+      legendDragging.value = false
+    }
+
+    watch([
+      () => colorFieldIndex.value,
+      () => colorRangeMode.value,
+      () => colorRangeMin.value,
+      () => colorRangeMax.value,
+      () => frdData.value
+    ], drawLegend)
+
+    return { 
+      frdData, onFile, scale, nodeCount, 
+      deformFieldIndex, colorFieldIndex, 
+      togglePlay, playing, speed, 
+      debugSolid, applyDeformation, showEdges, showColorbar, 
+      colorbarCanvas, useElementColors, flatShading, 
+      autoScale, colorRangeMode, colorRangeMin, colorRangeMax, legendCanvas, 
+      legendPos, legendDragging, startDrag, viewArea 
+    }
   }
 }
 </script>
-
 <style>
 .colorbar {
   width: 180px;

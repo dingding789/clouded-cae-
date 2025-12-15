@@ -1,5 +1,5 @@
 <template>
-  <div ref="container" style="width:100%; height:100%;"></div>
+  <div ref="container" style="width:100%; height:100%; background: #222;"></div>
 </template>
 
 <script>
@@ -8,41 +8,35 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { onMounted, ref, watch, onBeforeUnmount } from 'vue'
 
 export default {
-  props: ['frdData', 'scale', 'deformFieldIndex', 'colorFieldIndex', 'debugSolid', 'applyDeformation', 'showEdges', 'useElementColors', 'flatShading', 'autoScale', 'colorRangeMode', 'colorRangeMin', 'colorRangeMax'],
+  props: ['frdData', 'scale', 'deformFieldIndex', 'colorFieldIndex', 'applyDeformation', 'showEdges', 'autoScale', 'colorRangeMode', 'colorRangeMin', 'colorRangeMax'],
   setup (props) {
-  const container = ref(null)
-  let renderer, scene, camera, controls, objectMesh
+    const container = ref(null)
+    let renderer, scene, camera, controls
+    let contentGroup = null 
 
     function init () {
       scene = new THREE.Scene()
-      camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000)
-      camera.position.set(200, 200, 200)
+      // 背景色：深灰偏黑，让彩色云图更鲜艳
+      scene.background = new THREE.Color(0x222222) 
 
-  renderer = new THREE.WebGLRenderer({ antialias: true })
-  renderer.setPixelRatio(window.devicePixelRatio)
-  // 不在此处设置固定画布大小；在把 canvas 附到容器后根据容器尺寸设置 renderer 大小
+      camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100000)
+      camera.position.set(100, 100, 100)
 
-      const light = new THREE.DirectionalLight(0xffffff, 0.8)
-      light.position.set(1, 2, 3)
-      scene.add(light)
-      scene.add(new THREE.AmbientLight(0x888888))
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+      renderer.setPixelRatio(window.devicePixelRatio)
+      
+      container.value.appendChild(renderer.domElement)
+      renderer.domElement.style.width = '100%'
+      renderer.domElement.style.height = '100%'
 
       controls = new OrbitControls(camera, renderer.domElement)
       controls.enableDamping = true
 
-  // 网格参考线
-      const grid = new THREE.GridHelper(200, 20)
-      scene.add(grid)
+      // 添加坐标轴辅助 (红X 绿Y 蓝Z)
+      const axesHelper = new THREE.AxesHelper(50)
+      scene.add(axesHelper)
 
-  container.value.appendChild(renderer.domElement)
-  // 通过 CSS 让 canvas 填充容器，然后把 renderer 的绘制尺寸设置为容器尺寸
-  renderer.domElement.style.display = 'block'
-  renderer.domElement.style.width = '100%'
-  renderer.domElement.style.height = '100%'
-
-  // 根据容器的初始尺寸调整一次
-  onWindowResize()
-
+      onWindowResize()
       window.addEventListener('resize', onWindowResize)
       animate()
     }
@@ -53,371 +47,264 @@ export default {
       const h = container.value.clientHeight
       camera.aspect = w / h
       camera.updateProjectionMatrix()
-      // 设置 renderer 的绘制尺寸（同时通过 CSS 控制 canvas 大小）
       renderer.setSize(w, h, false)
     }
 
-    // 渲染循环：更新控制器并渲染场景
     function animate () {
       requestAnimationFrame(animate)
       controls.update()
       renderer.render(scene, camera)
-    }  
-
-    // 清理场景中的对象并释放资源
-    function clearScene () {
-      if (!scene) return
-      if (objectMesh) {
-        scene.remove(objectMesh)
-        // 递归释放几何体与材质
-        objectMesh.traverse((o) => {
-          if (o.geometry) o.geometry.dispose()
-          if (o.material) {
-            if (Array.isArray(o.material)) o.material.forEach(m => m.dispose())
-            else o.material.dispose()
-          }
-        })
-        objectMesh = null
-      }
     }
 
-  // props.frdData 预期结构为 { nodes, fields, elements }
-    function currentFields() {
-      if (!props.frdData || !props.frdData.fields) return { deform: null, color: null }
-      const fields = props.frdData.fields
-      const deform = fields[props.deformFieldIndex] || null
-      const color = fields[props.colorFieldIndex] || null
-      return { deform, color }
-    }
-
-    function rerender() {
-      if (!props.frdData) return
-      const nodes = props.frdData.nodes || []
-      const { deform, color } = currentFields()
-      createPointsWithField(nodes, deform, color, props.scale, props.frdData.elements)
-    }
-
-    watch(() => props.frdData, () => rerender(), { immediate: true })
-    watch(() => props.scale, () => rerender())
-    watch(() => props.deformFieldIndex, () => rerender())
-    watch(() => props.colorFieldIndex, () => rerender())
-    watch(() => props.useElementColors, () => rerender())
-    watch(() => props.flatShading, () => rerender())
-    watch(() => props.autoScale, () => rerender())
-    watch(() => props.colorRangeMode, () => rerender())
-    watch(() => props.colorRangeMin, () => rerender())
-    watch(() => props.colorRangeMax, () => rerender())
-
-  // CAE 常见彩虹色表：蓝 → 青 → 绿 → 黄 → 橙 → 红（分段线性插值）
+    // --- 核心：CAE 彩虹色映射 (Blue -> Cyan -> Green -> Yellow -> Red) ---
     function caeColorMap (t) {
       t = Math.max(0, Math.min(1, t))
+      // 0.0(蓝) -> 0.25(青) -> 0.5(绿) -> 0.75(黄) -> 1.0(红)
       const stops = [
-        { t: 0.00, rgb: [0, 0, 128] },    // 海军蓝 #000080
-        { t: 0.16, rgb: [0, 0, 255] },    // 蓝色   #0000FF
-        { t: 0.33, rgb: [0, 255, 255] },  // 青色   #00FFFF
-        { t: 0.50, rgb: [0, 255, 0] },    // 绿色   #00FF00
-        { t: 0.66, rgb: [255, 255, 0] },  // 黄色   #FFFF00
-        { t: 0.83, rgb: [255, 165, 0] },  // 橙色   #FFA500
-        { t: 1.00, rgb: [255, 0, 0] }     // 红色   #FF0000
+        { t: 0.00, r:0, g:0, b:1 },    // Blue
+        { t: 0.25, r:0, g:1, b:1 },    // Cyan
+        { t: 0.50, r:0, g:1, b:0 },    // Green
+        { t: 0.75, r:1, g:1, b:0 },    // Yellow
+        { t: 1.00, r:1, g:0, b:0 }     // Red
       ]
+      
       for (let i = 0; i < stops.length - 1; i++) {
-        const a = stops[i]
-        const b = stops[i + 1]
-        if (t >= a.t && t <= b.t) {
-          const u = (t - a.t) / (b.t - a.t || 1)
-          const r = (a.rgb[0] + (b.rgb[0] - a.rgb[0]) * u) / 255
-          const g = (a.rgb[1] + (b.rgb[1] - a.rgb[1]) * u) / 255
-          const bch = (a.rgb[2] + (b.rgb[2] - a.rgb[2]) * u) / 255
-          return [r, g, bch]
+        const s1 = stops[i]
+        const s2 = stops[i+1]
+        if (t >= s1.t && t <= s2.t) {
+          const ratio = (t - s1.t) / (s2.t - s1.t)
+          const r = s1.r + (s2.r - s1.r) * ratio
+          const g = s1.g + (s2.g - s1.g) * ratio
+          const b = s1.b + (s2.b - s1.b) * ratio
+          return [r, g, b]
         }
       }
-      const last = stops[stops.length - 1]
-      return [last.rgb[0] / 255, last.rgb[1] / 255, last.rgb[2] / 255]
+      return [1, 0, 0] // Fallback Red
     }
 
-    function resolveRange (min, max, altMin, altMax, valuesForQuantile) {
-      // 根据 props.colorRangeMode 与手动输入，决定色带范围
-      const mode = props.colorRangeMode || 'auto'
-      if (mode === 'manual' && props.colorRangeMin != null && props.colorRangeMax != null) {
-        return { min: props.colorRangeMin, max: props.colorRangeMax }
-      }
-      if (mode === 'symmetric') {
-        const m = Math.max(Math.abs(min || 0), Math.abs(max || 0), Math.abs(altMin || 0), Math.abs(altMax || 0))
-        return { min: -m, max: m }
-      }
-      if (mode === 'quantile' && valuesForQuantile && valuesForQuantile.length) {
-        const arr = valuesForQuantile.filter(v => v != null && isFinite(v))
-        if (!arr.length) return { min: 0, max: 1 }
-        arr.sort((a, b) => a - b)
-        const lowIdx = Math.floor(0.02 * (arr.length - 1))
-        const highIdx = Math.floor(0.98 * (arr.length - 1))
-        const qMin = arr[lowIdx]
-        const qMax = arr[highIdx]
-        if (qMin === qMax) return { min: qMin, max: qMax === 0 ? 1 : qMax * 1.01 }
-        return { min: qMin, max: qMax }
-      }
-      // auto: 优先使用提供的 min/max，否则备用范围
-      const mi = (min != null) ? min : (altMin != null ? altMin : 0)
-      const ma = (max != null) ? max : (altMax != null ? altMax : 1)
-      return { min: mi, max: ma }
-    }
-
-    function createPointsWithField (nodes, deformField, colorField, scale, elements) {
-      clearScene()
-      if (!nodes || nodes.length === 0) return
-
-  // 构建 id -> index 的映射以便通过 INP 的节点 id 查找索引
-      const idToIndex = new Map()
-      for (let i = 0; i < nodes.length; i++) idToIndex.set(nodes[i].id, i)
-
-  // 计算每个顶点的位置（如果需要，应用位移变形）
-      const positions = new Float32Array(nodes.length * 3)
-      // 计算模型对角线以支持 autoScale
-      let diag = 0
-      try {
-        if (nodes.length > 0) {
-          let minx = Infinity, miny = Infinity, minz = Infinity
-          let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity
-          for (const n of nodes) {
-            if (n.x < minx) minx = n.x
-            if (n.y < miny) miny = n.y
-            if (n.z < minz) minz = n.z
-            if (n.x > maxx) maxx = n.x
-            if (n.y > maxy) maxy = n.y
-            if (n.z > maxz) maxz = n.z
+    // --- 核心：渲染逻辑 ---
+    function rerender() {
+      // 1. 清理旧模型
+      if (contentGroup) {
+        scene.remove(contentGroup)
+        contentGroup.traverse(o => {
+          if (o.geometry) o.geometry.dispose()
+          if (o.material) {
+            [].concat(o.material).forEach(m => m.dispose())
           }
-          const dx = maxx - minx
-          const dy = maxy - miny
-          const dz = maxz - minz
-          diag = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0
-        }
-      } catch (e) {
-        diag = 0
+        })
+        contentGroup = null
       }
 
-      // 当 autoScale 开启时，根据模型对角线对用户滑块进行放大
-      const effectiveScale = (props.autoScale && diag > 0) ? (scale * (diag / 100.0)) : scale
+      if (!props.frdData || !props.frdData.nodes || props.frdData.nodes.length === 0) return
+
+      const { nodes, fields, elements } = props.frdData
+      const deformField = fields[props.deformFieldIndex]
+      const colorField = fields[props.colorFieldIndex]
+
+      contentGroup = new THREE.Group()
+      scene.add(contentGroup)
+
+      const idToIndex = new Map()
+      nodes.forEach((n, i) => idToIndex.set(n.id, i))
+
+      // 2. 计算变形比例 (Auto Scale)
+      // 计算包围盒对角线长度，用于自动设定变形系数
+      let diag = 100
+      let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity, minZ=Infinity, maxZ=-Infinity
+      nodes.forEach(n => {
+        if (n.x<minX) minX=n.x; if (n.x>maxX) maxX=n.x;
+        if (n.y<minY) minY=n.y; if (n.y>maxY) maxY=n.y;
+        if (n.z<minZ) minZ=n.z; if (n.z>maxZ) maxZ=n.z;
+      })
+      if (minX !== Infinity) {
+        const dx=maxX-minX, dy=maxY-minY, dz=maxZ-minZ
+        diag = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1
+      }
+      
+      // 如果开启 AutoScale，将变形放大到模型尺寸的 10% 左右，方便肉眼观察
+      // 如果 deformField 最大值很小，scale 会很大
+      let effectiveScale = props.scale
+      if (props.autoScale && deformField && deformField.max > 0) {
+        // 目标变形量 = 模型尺寸 * 0.15 * slider(1..200)/10
+        const targetDeform = diag * 0.15 * (props.scale / 50.0) 
+        effectiveScale = targetDeform / deformField.max
+      }
+
+      // 3. 计算顶点位置 (Positions) & 颜色 (Colors)
+      const positions = new Float32Array(nodes.length * 3)
+      const colors = new Float32Array(nodes.length * 3)
+
+      // 确定色阶范围
+      let cMin = 0, cMax = 1
+      if (colorField) {
+        cMin = colorField.min
+        cMax = colorField.max
+        // 【新增】保险措施：如果范围计算出错了，强制修正
+        if (!isFinite(cMin) || !isFinite(cMax)) { cMin = 0; cMax = 1; }
+        if (Math.abs(cMax - cMin) < 1e-9) { cMax = cMin + 1; }
+        // 手动范围覆盖
+        if (props.colorRangeMode === 'manual') {
+          if (props.colorRangeMin != null) cMin = props.colorRangeMin
+          if (props.colorRangeMax != null) cMax = props.colorRangeMax
+        }
+      }
+      const cRange = cMax - cMin || 1
 
       for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i]
-        let x = n.x
-        let y = n.y
-        let z = n.z
-        // 如果用户强制设置该 field 类型（_forcedType），则优先使用它；否则使用解析器识别的 type
-        const effectiveType = deformField && deformField._forcedType ? deformField._forcedType : (deformField ? deformField.type : null)
-        if (props.applyDeformation && effectiveType === 'displacement' && deformField && deformField.values && deformField.values[i]) {
+        let x = n.x, y = n.y, z = n.z
+
+        // 应用变形
+        if (props.applyDeformation && deformField && deformField.values[i]) {
           const v = deformField.values[i]
-          x = n.x + (v.a || 0) * effectiveScale
-          y = n.y + (v.b || 0) * effectiveScale
-          z = n.z + (v.c || 0) * effectiveScale
+          x += v.a * effectiveScale
+          y += v.b * effectiveScale
+          z += v.c * effectiveScale
         }
-        positions[i * 3 + 0] = x
-        positions[i * 3 + 1] = y
-        positions[i * 3 + 2] = z
+        positions[i*3] = x
+        positions[i*3+1] = y
+        positions[i*3+2] = z
+
+        // 计算颜色
+        let r=0.8, g=0.8, b=0.8 // 默认灰
+        if (colorField && colorField.scalarValues[i] != null) {
+          const val = colorField.scalarValues[i]
+          const t = (val - cMin) / cRange
+          const rgb = caeColorMap(t)
+          r = rgb[0]; g = rgb[1]; b = rgb[2]
+        }
+        colors[i*3] = r
+        colors[i*3+1] = g
+        colors[i*3+2] = b
       }
 
-  // 如果给出了 elements 信息，则基于单元连接构建网格（对四节点单元进行简化三角化）
-      if (elements && elements.length > 0) {
-        // 如果启用了按单元着色并且 field 提供了 elValues，则使用非索引几何体按单元上色（flat per element）
-        if (props.useElementColors && colorField && colorField.elValues && Object.keys(colorField.elValues).length > 0) {
-          const posArr = []
-          const colorArr = []
-          let triCount = 0
-          // 统计 elValues 的 min/max
-          const elVals = colorField.elValues
-          let elMin = Infinity, elMax = -Infinity
-          for (const k of Object.keys(elVals)) {
-            const v = elVals[k]
-            if (v == null) continue
-            if (v < elMin) elMin = v
-            if (v > elMax) elMax = v
-          }
-          if (elMin === Infinity) { elMin = 0; elMax = 0 }
-          // 覆盖率：有多少 mesh 元素在 elValues 中有值
-          let covered = 0
-          for (const el of elements) {
-            if (el && elVals[el.id] != null) covered++
-          }
-          const coverage = elements.length > 0 ? (covered / elements.length) : 0
-          // 如果覆盖率过低（例如 < 50%），自动回退到顶点上色，避免整片变为默认颜色
-          if (coverage < 0.5) {
-            console.warn('[ThreeScene] element-colors coverage too low, fallback to vertex colors. coverage=', coverage.toFixed(3), 'covered=', covered, 'total=', elements.length)
-          } else {
-            // 在元素着色模式下，优先使用元素范围映射颜色（更贴合“块状配色”预期）
-            const { min: rangeMin, max: rangeMax } = resolveRange(null, null, elMin, elMax, Object.values(elVals))
+      // 4. 构建几何体 (Geometry)
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
 
-            for (const el of elements) {
-              if (!el.nodes || el.nodes.length < 3) continue
-              // 三角化：对任意多边形用 fan 三角化
-              const corners = el.nodes
-              for (let k = 1; k < corners.length - 1; k++) {
-                const i0 = idToIndex.get(corners[0])
-                const i1 = idToIndex.get(corners[k])
-                const i2 = idToIndex.get(corners[k + 1])
-                if (i0 === undefined || i1 === undefined || i2 === undefined) continue
-                const v0x = positions[i0 * 3 + 0], v0y = positions[i0 * 3 + 1], v0z = positions[i0 * 3 + 2]
-                const v1x = positions[i1 * 3 + 0], v1y = positions[i1 * 3 + 1], v1z = positions[i1 * 3 + 2]
-                const v2x = positions[i2 * 3 + 0], v2y = positions[i2 * 3 + 1], v2z = positions[i2 * 3 + 2]
-                posArr.push(v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z)
-                // 元素颜色：有值用 elValues，否则使用元素范围的最小值
-                const ev = elVals[el.id] != null ? elVals[el.id] : elMin
-                const t = (ev - rangeMin) / ((rangeMax - rangeMin) || 1)
-                const [r, g, b] = caeColorMap(t)
-                colorArr.push(r, g, b, r, g, b, r, g, b)
-                triCount++
+      const indices = []
+      if (elements && elements.length) {
+        const pushTri = (a, b, c) => {
+          if (a !== undefined && b !== undefined && c !== undefined) {
+            indices.push(a, b, c)
+          }
+        }
+        const pushQuad = (a, b, c, d) => {
+          pushTri(a, b, c)
+          pushTri(a, c, d)
+        }
+
+        elements.forEach(el => {
+          const ids = el.nodes || []
+          const n = ids.length
+          if (n < 3) return
+
+          const idx = ids.map(id => idToIndex.get(id))
+          const type = el.type
+
+          switch (type) {
+            case 10: // VTK_TETRA (4 节点四面体，4 个三角面)
+              pushTri(idx[0], idx[1], idx[2])
+              pushTri(idx[0], idx[1], idx[3])
+              pushTri(idx[0], idx[2], idx[3])
+              pushTri(idx[1], idx[2], idx[3])
+              break
+            case 12: // VTK_HEXAHEDRON (8 节点六面体，6 个四边形面)
+              pushQuad(idx[0], idx[1], idx[2], idx[3])
+              pushQuad(idx[4], idx[5], idx[6], idx[7])
+              pushQuad(idx[0], idx[1], idx[5], idx[4])
+              pushQuad(idx[1], idx[2], idx[6], idx[5])
+              pushQuad(idx[2], idx[3], idx[7], idx[6])
+              pushQuad(idx[3], idx[0], idx[4], idx[7])
+              break
+            case 13: // VTK_WEDGE (6 节点棱柱，2 三角 + 3 四边形)
+              pushTri(idx[0], idx[2], idx[1])
+              pushTri(idx[3], idx[4], idx[5])
+              pushQuad(idx[0], idx[1], idx[4], idx[3])
+              pushQuad(idx[1], idx[2], idx[5], idx[4])
+              pushQuad(idx[2], idx[0], idx[3], idx[5])
+              break
+            case 14: // VTK_PYRAMID (5 节点金字塔)
+              pushQuad(idx[0], idx[1], idx[2], idx[3])
+              pushTri(idx[0], idx[1], idx[4])
+              pushTri(idx[1], idx[2], idx[4])
+              pushTri(idx[2], idx[3], idx[4])
+              pushTri(idx[3], idx[0], idx[4])
+              break
+            default:
+              // 兜底：扇形三角化，适用于三角形/多边形面片
+              for (let k = 1; k < n - 1; k++) {
+                pushTri(idx[0], idx[k], idx[k + 1])
               }
-            }
-            if (triCount > 0) {
-              const geo = new THREE.BufferGeometry()
-              const posBuf = new Float32Array(posArr)
-              const colBuf = new Float32Array(colorArr)
-              geo.setAttribute('position', new THREE.BufferAttribute(posBuf, 3))
-              geo.setAttribute('color', new THREE.BufferAttribute(colBuf, 3))
-              try { geo.computeVertexNormals() } catch (e) {}
-              const mat = props.debugSolid ? new THREE.MeshBasicMaterial({ color: 0x2194ce, side: THREE.DoubleSide }) : new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: !!props.flatShading, side: THREE.DoubleSide })
-              objectMesh = new THREE.Mesh(geo, mat)
-              scene.add(objectMesh)
-              try { if (props.showEdges) { const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0xffffff })); objectMesh.add(edges) } } catch (e) {}
-              const box = new THREE.Box3().setFromBufferAttribute(geo.getAttribute('position'))
-              const size = box.getSize(new THREE.Vector3()).length()
-              const center = box.getCenter(new THREE.Vector3())
-              if (size > 0) {
-                const distance = size / (2 * Math.tan(Math.PI * camera.fov / 360))
-                camera.position.copy(center).add(new THREE.Vector3(distance, distance, distance))
-                camera.lookAt(center)
-              }
-              console.log('[ThreeScene] create Mesh (element colors): tris=', triCount, 'elRange=', elMin, elMax, 'coverage=', coverage.toFixed(3), 'diag=', diag, 'effectiveScale=', effectiveScale, 'deformFieldType=', deformField ? deformField.type : null, 'colorFieldType=', colorField ? colorField.type : null)
-              return
-            }
+              break
           }
-        }
+        })
+      }
+      if (indices.length > 0) geometry.setIndex(indices)
+      geometry.computeVertexNormals()
 
-        // 否则使用之前的顶点色/索引 mesh 路径（保持向后兼容）
-        const indices = []
-        for (const el of elements) {
-            if (!el.nodes || el.nodes.length < 3) continue
-            const corners = el.nodes
-            const i0 = idToIndex.get(corners[0])
-            if (i0 === undefined) continue
-            // fan 三角化，支持任意多边形；当为四边形时效果与原逻辑等价
-            for (let k = 1; k < corners.length - 1; k++) {
-              const i1 = idToIndex.get(corners[k])
-              const i2 = idToIndex.get(corners[k + 1])
-              if (i1 === undefined || i2 === undefined) continue
-              indices.push(i0, i1, i2)
-          }
-        }
-        // 仅当生成了索引时创建 Mesh
-        if (indices.length > 0) {
-          const geo = new THREE.BufferGeometry()
-          geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-          geo.setIndex(indices)
+      // 5. 创建实体 Mesh (CAE 风格: 无光照 BasicMaterial)
+      const material = new THREE.MeshBasicMaterial({
+        vertexColors: true, // 必须开启，才能显示彩虹色
+        side: THREE.DoubleSide,
+        polygonOffset: true, // 让实体稍微退后一点，防止和网格线闪烁
+        polygonOffsetFactor: 1, 
+        polygonOffsetUnits: 1
+      })
+      const mesh = new THREE.Mesh(geometry, material)
+      contentGroup.add(mesh)
 
-          // 计算法线以获得正确的光照与平滑着色（如果 mesh 有三角索引）
-          try { geo.computeVertexNormals() } catch (e) {}
-
-          // 顶点颜色：只要存在 scalarValues（例如位移的幅值或应力标量），就将每个顶点的 scalar 值映射为颜色
-          if (colorField && colorField.scalarValues) {
-            const colors = new Float32Array(nodes.length * 3)
-            const { min, max } = resolveRange(colorField.min, colorField.max, null, null, colorField.scalarValues)
-            const range = (max - min) || 1
-            for (let i = 0; i < nodes.length; i++) {
-              const s = colorField.scalarValues[i] != null ? colorField.scalarValues[i] : min
-              const t = (s - min) / range
-              const [r, g, b] = caeColorMap(t)
-              colors[i * 3 + 0] = r
-              colors[i * 3 + 1] = g
-              colors[i * 3 + 2] = b
-            }
-            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-          }
-          const useVertexColors = !!(colorField && colorField.scalarValues && colorField.scalarValues.some(v => v != null))
-          let mat
-          if (props.debugSolid) {
-            mat = new THREE.MeshBasicMaterial({ color: 0x2194ce, side: THREE.DoubleSide })
-            console.log('[ThreeScene] DEBUG force MeshBasicMaterial')
-          } else {
-            const baseColor = 0x2194ce
-            const emiss = useVertexColors ? 0x000000 : baseColor
-            mat = new THREE.MeshStandardMaterial({ color: baseColor, roughness: 0.6, metalness: 0.1, vertexColors: useVertexColors, side: THREE.DoubleSide, emissive: emiss, flatShading: !!props.flatShading })
-          }
-          console.log('[ThreeScene] create Mesh: elements=', elements.length, 'indices=', indices.length, 'vertexColors=', useVertexColors, 'deformFieldType=', deformField ? deformField.type : 'null', 'colorFieldType=', colorField ? colorField.type : 'null', 'colorScalarCount=', colorField && colorField.scalarValues ? colorField.scalarValues.reduce((c,v)=> c + (v!=null?1:0),0) : 0, 'applyDeformation=', props.applyDeformation, 'diag=', diag, 'effectiveScale=', effectiveScale)
-          objectMesh = new THREE.Mesh(geo, mat)
-          scene.add(objectMesh)
-
-          // 在暗色背景下添加白色边线以提高可读性
-          try {
-            if (props.showEdges) {
-              const edgesGeo = new THREE.EdgesGeometry(geo)
-              const edgesMat = new THREE.LineBasicMaterial({ color: 0xffffff })
-              const edges = new THREE.LineSegments(edgesGeo, edgesMat)
-              objectMesh.add(edges)
-            }
-          } catch (e) {
-            console.warn('EdgesGeometry failed', e)
-          }
-
-          // 自动缩放相机以适配当前网格
-          const box = new THREE.Box3().setFromBufferAttribute(geo.getAttribute('position'))
-          const size = box.getSize(new THREE.Vector3()).length()
-          const center = box.getCenter(new THREE.Vector3())
-          if (size > 0) {
-            const distance = size / (2 * Math.tan(Math.PI * camera.fov / 360))
-            camera.position.copy(center).add(new THREE.Vector3(distance, distance, distance))
-            camera.lookAt(center)
-          }
-          return
-        }
+      // 6. 创建线框 Mesh (黑色半透明)
+      if (props.showEdges && indices.length > 0) {
+        const wireMat = new THREE.MeshBasicMaterial({
+          color: 0x000000,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.25 // 半透明黑色，像 ANSYS
+        })
+        const wireMesh = new THREE.Mesh(geometry, wireMat)
+        contentGroup.add(wireMesh)
+      } else if (indices.length === 0) {
+        // 点云兜底
+        const ptsMat = new THREE.PointsMaterial({ size: 3, vertexColors: true })
+        contentGroup.add(new THREE.Points(geometry, ptsMat))
       }
 
-  // 回退渲染：如果没有单元信息，则以点云形式渲染
-      const geo = new THREE.BufferGeometry()
-      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  // color 属性当且仅当存在 scalarValues 时使用（不再严格依赖 field.type）
-      let colors = null
-      if (colorField && colorField.scalarValues) {
-        colors = new Float32Array(nodes.length * 3)
-        const { min, max } = resolveRange(colorField.min, colorField.max, null, null, colorField.scalarValues)
-        const range = (max - min) || 1
-        for (let i = 0; i < nodes.length; i++) {
-          const s = colorField.scalarValues[i] != null ? colorField.scalarValues[i] : min
-          const t = (s - min) / range
-          const [r, g, b] = caeColorMap(t)
-          colors[i * 3 + 0] = r
-          colors[i * 3 + 1] = g
-          colors[i * 3 + 2] = b
-        }
-        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-        const useVertexColors = true
-        const mat = new THREE.PointsMaterial({ size: 1.8, vertexColors: useVertexColors })
-        console.log('[ThreeScene] create Points (scalar colors) nodes=', nodes.length, 'deformFieldType=', deformField ? deformField.type : null, 'colorFieldType=', colorField ? colorField.type : null)
-        objectMesh = new THREE.Points(geo, mat)
-        scene.add(objectMesh)
-      } else {
-  const mat = new THREE.PointsMaterial({ size: 3.0, color: 0xffffff })
-  objectMesh = new THREE.Points(geo, mat)
-  console.log('[ThreeScene] create Points (default color) nodes=', nodes.length, 'deformFieldType=', deformField ? deformField.type : null, 'colorFieldType=', colorField ? colorField.type : null)
-        scene.add(objectMesh)
-      }
-
-  // 自动缩放相机以适配点云
-      const box = new THREE.Box3().setFromBufferAttribute(geo.getAttribute('position'))
-      const size = box.getSize(new THREE.Vector3()).length()
-      const center = box.getCenter(new THREE.Vector3())
-      if (size > 0) {
-        const distance = size / (2 * Math.tan(Math.PI * camera.fov / 360))
-        camera.position.copy(center).add(new THREE.Vector3(distance, distance, distance))
+      // 7. 调整相机聚焦 (仅在首次加载或切换文件时)
+      if (!window.__cameraFocused && positions.length > 0) {
+        const box = new THREE.Box3().setFromBufferAttribute(geometry.getAttribute('position'))
+        const center = box.getCenter(new THREE.Vector3())
+        const size = box.getSize(new THREE.Vector3()).length()
+        camera.position.copy(center).add(new THREE.Vector3(size, size, size))
         camera.lookAt(center)
+        window.__cameraFocused = true
       }
     }
 
-    onMounted(() => {
-      init()
-    })
+    // 监听 props 变化
+    watch(() => props.frdData, () => {
+      window.__cameraFocused = false // 新数据重置相机
+      rerender()
+    }, { immediate: true })
 
-    onBeforeUnmount(() => {
+    watch([
+      () => props.scale,
+      () => props.deformFieldIndex,
+      () => props.colorFieldIndex,
+      () => props.applyDeformation,
+      () => props.showEdges,
+      () => props.autoScale,
+      () => props.colorRangeMode,
+      () => props.colorRangeMin,
+      () => props.colorRangeMax
+    ], rerender)
+
+    onMounted(init)
+    onBeforeUnmount(() => { 
       window.removeEventListener('resize', onWindowResize)
-      if (renderer) renderer.dispose()
+      if (renderer) renderer.dispose() 
     })
 
     return { container }
